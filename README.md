@@ -10,15 +10,17 @@ This package provides a MailSlurp-like API for reading emails stored in an S3 bu
 
 Install the correct version of node using nvm
 
-```
+```bash
 nvm install
+nvm use
+corepack enable
 ```
 
 ## Installation
 
 ```bash
-npm install
-npm run build
+pnpm install
+pnpm run build
 ```
 
 ## Prerequisites
@@ -26,6 +28,8 @@ npm run build
 1. **AWS Credentials**: You need AWS credentials configured (via `aws configure`, environment variables, or IAM role)
 2. **IAM Role Access**: If using the IAM role created by the Terraform module, ensure your IAM user/group has permission to assume the role
 3. **S3 Bucket**: The S3 bucket must be created and configured by the SES receiving Terraform module
+
+For the full infrastructure and Playwright setup flow, see [docs/terraform-playwright-setup.md](docs/terraform-playwright-setup.md).
 
 ## Usage
 
@@ -40,13 +44,20 @@ const bucketName = process.env.SES_BUCKET_NAME; // e.g., from terraform output
 
 const client = new SESEmailClient({
   bucketName: bucketName!,
-  region: 'us-east-1',
+  region: process.env.AWS_REGION,
   roleArn: roleArn,
   roleSessionName: 'e2e-test-session'
 });
 
-// Wait for latest email (similar to MailSlurp)
-const email = await client.waitForLatestEmail('test@example.com', 30000, true);
+const testStartedAt = new Date();
+
+// Trigger your application to send an email, then wait for the new message.
+const email = await client.waitForEmail({
+  recipientEmail: 'test@example.com',
+  after: testStartedAt,
+  timeoutMs: 60000,
+  subjectMatches: /sign in|magic/i
+});
 
 if (email) {
   console.log('Subject:', email.subject);
@@ -67,7 +78,7 @@ import { SESEmailClient } from '@ses-receiving/email-client';
 
 const client = new SESEmailClient({
   bucketName: 'ses-inbound-app-markcallen-com',
-  region: 'us-east-1'
+  region: process.env.AWS_REGION
 });
 
 const email = await client.getLatestEmail('test@example.com');
@@ -95,13 +106,15 @@ test.describe('Magic Link Authentication', () => {
 
     emailClient = new SESEmailClient({
       bucketName,
-      region: 'us-east-1',
+      region: process.env.AWS_REGION,
       roleArn: roleArn,
       roleSessionName: 'e2e-test-session'
     });
   });
 
   test('should authenticate user via magic email link', async ({ page }) => {
+    const testStartedAt = new Date();
+
     // Navigate to sign-in page
     await page.goto(BASE_URL);
     await page.getByTestId('header-signin-button').click();
@@ -117,19 +130,18 @@ test.describe('Magic Link Authentication', () => {
       page.locator('text=/check your email|magic link sent|email sent/i')
     ).toBeVisible();
 
-    // Wait for the magic link email to arrive (similar to MailSlurp)
-    const email = await emailClient.waitForLatestEmail(
-      RECIPIENT_EMAIL,
-      30000,
-      true
-    );
+    const email = await emailClient.waitForEmail({
+      recipientEmail: RECIPIENT_EMAIL,
+      after: testStartedAt,
+      timeoutMs: 60000,
+      subjectMatches: /sign in|magic/i
+    });
 
     expect(email).toBeTruthy();
     expect(email.subject).toContain('Sign in');
 
     // Extract the magic link from the email
-    const links = emailClient.getEmailLinks(email);
-    const loginLink = links.find(link => link.includes('localhost'));
+    const loginLink = emailClient.getEmailLink(email!, link => link.includes('localhost'));
 
     expect(loginLink).toBeTruthy();
 
@@ -157,16 +169,30 @@ new SESEmailClient(config: SESEmailClientConfig)
 - `region` (string, optional): AWS region (default: "us-east-1")
 - `roleArn` (string, optional): ARN of IAM role to assume for S3 access
 - `roleSessionName` (string, optional): Session name for role assumption (default: "ses-email-reader")
+- `s3Client` (S3Client, optional): Preconfigured S3 client, primarily useful for tests or custom credential providers
 
 #### Methods
 
 ##### `waitForLatestEmail(recipientEmail, timeout, unreadOnly)`
 
-Waits for the latest email to arrive for a recipient.
+Backwards-compatible helper that waits for the latest email to arrive for a recipient. Prefer `waitForEmail` for new tests.
 
 - `recipientEmail` (string): Email address of the recipient
 - `timeout` (number): Maximum time to wait in milliseconds (default: 30000)
-- `unreadOnly` (boolean): If true, only return unread emails (default: false, not fully implemented)
+- `unreadOnly` (boolean): If true, only considers emails created after the wait starts
+
+Returns: `Promise<Email | null>`
+
+##### `waitForEmail(options)`
+
+Waits for a new email matching optional filters.
+
+- `recipientEmail` (string): Email address of the recipient
+- `timeoutMs` (number): Maximum time to wait in milliseconds (default: 30000)
+- `pollIntervalMs` (number): Delay between S3 polls in milliseconds (default: 1000)
+- `after` (Date): Only consider objects with `LastModified` at or after this time
+- `subjectIncludes` / `subjectMatches`: Optional subject filters
+- `bodyIncludes` / `bodyMatches`: Optional body filters
 
 Returns: `Promise<Email | null>`
 
@@ -186,6 +212,12 @@ Lists all email keys for a recipient.
 
 Returns: `Promise<string[]>` - Array of S3 object keys
 
+##### `listEmailSummaries(recipientEmail)`
+
+Lists all email object summaries for a recipient, including key, last modified time, and size. This method handles S3 pagination.
+
+Returns: `Promise<EmailSummary[]>`
+
 ##### `getEmail(recipientEmail, emailKey)`
 
 Retrieves and parses a specific email.
@@ -202,6 +234,18 @@ Extracts all URLs from an email's HTML and text content.
 - `email` (Email): Email object
 
 Returns: `string[]` - Array of URLs found in the email
+
+##### `getEmailLink(email, matcher)`
+
+Returns the first URL in the email, or the first URL matching a regex or predicate function.
+
+Returns: `string | undefined`
+
+##### `getEmailCodes(email, pattern)`
+
+Extracts one-time codes from the email body. The default pattern returns 6 digit codes.
+
+Returns: `string[]`
 
 ## Email Interface
 
@@ -235,7 +279,7 @@ SES_BUCKET_NAME=ses-inbound-app-markcallen-com
 SES_S3_ACCESS_ROLE_ARN=arn:aws:iam::123456789012:role/ses-inbound-app-s3-access-role
 
 # Optional
-AWS_REGION=us-east-1
+AWS_REGION=us-east-2
 ```
 
 You can get these values from Terraform outputs:
@@ -279,14 +323,16 @@ terraform output -raw s3_access_role_arn
 
 ```bash
 # Install dependencies
-npm install
+pnpm install
 
 # Build TypeScript
-npm run build
+pnpm run build
 
-# Run tests (when implemented)
-npm test
+# Run typecheck tests
+pnpm test
 ```
+
+The test suite uses Vitest and mocked AWS clients; it does not call AWS.
 
 ## License
 

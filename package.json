@@ -2,12 +2,14 @@
   "name": "@ses-receiving/email-client",
   "version": "1.0.0",
   "description": "Client library for reading emails from AWS SES S3 bucket, similar to MailSlurp API",
+  "packageManager": "pnpm@10.14.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "jest",
-    "prepublishOnly": "npm run build"
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run typecheck && vitest run src",
+    "prepublishOnly": "pnpm run build"
   },
   "keywords": [
     "aws",
@@ -27,7 +29,8 @@
   "devDependencies": {
     "@types/mailparser": "^3.4.6",
     "@types/node": "^20.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^4.1.10"
   },
   "files": [
     "dist"
