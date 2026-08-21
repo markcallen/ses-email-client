@@ -125,10 +125,13 @@ describe("SESEmailClient", () => {
     const client = createClient();
     const email = await client.getEmail("test@example.com", "new.eml");
     const globalPattern = /\b\d{6}\b/g;
-    globalPattern.lastIndex = 10;
+    globalPattern.lastIndex = 20;
 
     expect(client.getEmailLink(email, /token=/)).toBe("https://app.example.com/login?token=abc123");
-    expect(client.getEmailCodes({ ...email, html: "<p>code 123456</p>" }, globalPattern)).toEqual(["123456"]);
+    expect(client.getEmailCodes({ ...email, body: "code 111111", text: undefined, html: "<p>code 222222 222222</p>" }, globalPattern)).toEqual([
+      "111111",
+      "222222",
+    ]);
   });
 
   it("does not repeatedly fetch unchanged nonmatching candidates while waiting", async () => {

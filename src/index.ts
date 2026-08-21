@@ -43,6 +43,10 @@ export interface WaitForEmailOptions {
   bodyMatches?: RegExp;
 }
 
+interface AwsRequestOptions {
+  abortSignal?: AbortSignal;
+}
+
 export class SESEmailClient {
   private s3Client: S3Client | null = null;
   private bucketName: string;
@@ -133,7 +137,18 @@ export class SESEmailClient {
     const checkedNonMatchingKeys = new Set<string>();
 
     while (Date.now() - startTime < timeoutMs) {
-      const summaries = await this.listEmailSummaries(options.recipientEmail);
+      let summaries: EmailSummary[];
+      try {
+        summaries = await this.withDeadline(
+          timeoutMs - (Date.now() - startTime),
+          (abortSignal) => this.listEmailSummaries(options.recipientEmail, { abortSignal })
+        );
+      } catch (error) {
+        if (this.isTimeoutError(error)) {
+          return null;
+        }
+        throw error;
+      }
       const candidates = summaries
         .filter((summary) => !options.after || (!!summary.lastModified && summary.lastModified >= options.after))
         .sort((a, b) => (b.lastModified?.getTime() || 0) - (a.lastModified?.getTime() || 0));
@@ -148,7 +163,18 @@ export class SESEmailClient {
           return null;
         }
 
-        const email = await this.getEmail(options.recipientEmail, summary.key);
+        let email: Email;
+        try {
+          email = await this.withDeadline(
+            timeoutMs - (Date.now() - startTime),
+            (abortSignal) => this.getEmail(options.recipientEmail, summary.key, { abortSignal })
+          );
+        } catch (error) {
+          if (this.isTimeoutError(error)) {
+            return null;
+          }
+          throw error;
+        }
 
         if (this.emailMatches(email, options)) {
           if (Date.now() - startTime >= timeoutMs) {
@@ -184,7 +210,7 @@ export class SESEmailClient {
   /**
    * List all email object summaries for a recipient.
    */
-  async listEmailSummaries(recipientEmail: string): Promise<EmailSummary[]> {
+  async listEmailSummaries(recipientEmail: string, requestOptions: AwsRequestOptions = {}): Promise<EmailSummary[]> {
     await this.ensureInitialized();
     if (!this.s3Client) {
       throw new Error("S3 client not initialized");
@@ -201,7 +227,7 @@ export class SESEmailClient {
         ContinuationToken: continuationToken,
       });
 
-      const response = await this.s3Client.send(command);
+      const response = await this.s3Client.send(command, requestOptions);
       for (const object of response.Contents || []) {
         if (object.Key) {
           summaries.push({
@@ -227,7 +253,7 @@ export class SESEmailClient {
    * @param emailKey - S3 key of the email file
    * @returns Parsed email object
    */
-  async getEmail(recipientEmail: string, emailKey: string): Promise<Email> {
+  async getEmail(recipientEmail: string, emailKey: string, requestOptions: AwsRequestOptions = {}): Promise<Email> {
     await this.ensureInitialized();
     if (!this.s3Client) {
       throw new Error("S3 client not initialized");
@@ -241,7 +267,7 @@ export class SESEmailClient {
       Key: fullKey,
     });
 
-    const response = await this.s3Client.send(command);
+    const response = await this.s3Client.send(command, requestOptions);
     if (!response.Body) {
       throw new Error(`Email not found: ${fullKey}`);
     }
@@ -317,7 +343,7 @@ export class SESEmailClient {
    * Extract one-time codes from the email body. Defaults to 6 digit codes.
    */
   getEmailCodes(email: Email, pattern: RegExp = /\b\d{6}\b/g): string[] {
-    const body = [email.text, email.html].filter(Boolean).join("\n");
+    const body = this.getSearchableBody(email);
     const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
     const globalPattern = new RegExp(pattern.source, flags);
     return [...new Set([...body.matchAll(globalPattern)].map((match) => match[0]))];
@@ -365,7 +391,7 @@ export class SESEmailClient {
       }
     }
 
-    const body = [email.text, email.html].filter(Boolean).join("\n");
+    const body = this.getSearchableBody(email);
     if (options.bodyIncludes && !body.includes(options.bodyIncludes)) {
       return false;
     }
@@ -378,6 +404,38 @@ export class SESEmailClient {
     }
 
     return true;
+  }
+
+  private getSearchableBody(email: Email): string {
+    return [email.body, email.text, email.html].filter(Boolean).join("\n");
+  }
+
+  private async withDeadline<T>(remainingMs: number, operation: (abortSignal: AbortSignal) => Promise<T>): Promise<T> {
+    if (remainingMs <= 0) {
+      throw new Error("Timed out waiting for email");
+    }
+
+    const controller = new AbortController();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        operation(controller.signal),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            controller.abort();
+            reject(new Error("Timed out waiting for email"));
+          }, remainingMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
+  private isTimeoutError(error: unknown): boolean {
+    return error instanceof Error && (error.message === "Timed out waiting for email" || error.name === "AbortError");
   }
 }
 
