@@ -58,6 +58,36 @@ class MockS3Client {
   });
 }
 
+class NonMatchingS3Client {
+  public readonly send = vi.fn(async (command: unknown) => {
+    if (command instanceof ListObjectsV2Command) {
+      return {
+        Contents: [
+          {
+            Key: "test@example.com/no-match.eml",
+            LastModified: new Date("2026-01-02T00:00:00Z"),
+            Size: 200,
+          },
+        ],
+      };
+    }
+
+    if (command instanceof GetObjectCommand) {
+      return {
+        Body: new MockBody([
+          "From: no-reply@example.com",
+          "To: test@example.com",
+          "Subject: Welcome",
+          "",
+          "This body does not match.",
+        ].join("\r\n")),
+      };
+    }
+
+    throw new Error("Unexpected command");
+  });
+}
+
 function createClient(mockS3Client = new MockS3Client()): SESEmailClient {
   return new SESEmailClient({
     bucketName: "bucket",
@@ -82,7 +112,7 @@ describe("SESEmailClient", () => {
     const email = await client.waitForEmail({
       recipientEmail: "test@example.com",
       after: new Date("2026-01-01T12:00:00Z"),
-      timeoutMs: 10,
+      timeoutMs: 1000,
       pollIntervalMs: 1,
       subjectMatches: /sign in/i,
     });
@@ -94,8 +124,27 @@ describe("SESEmailClient", () => {
   it("extracts links and one-time codes from parsed email bodies", async () => {
     const client = createClient();
     const email = await client.getEmail("test@example.com", "new.eml");
+    const globalPattern = /\b\d{6}\b/g;
+    globalPattern.lastIndex = 10;
 
     expect(client.getEmailLink(email, /token=/)).toBe("https://app.example.com/login?token=abc123");
-    expect(client.getEmailCodes(email)).toEqual(["123456"]);
+    expect(client.getEmailCodes({ ...email, html: "<p>code 123456</p>" }, globalPattern)).toEqual(["123456"]);
+  });
+
+  it("does not repeatedly fetch unchanged nonmatching candidates while waiting", async () => {
+    const mockS3Client = new NonMatchingS3Client();
+    const client = createClient(mockS3Client);
+
+    const email = await client.waitForEmail({
+      recipientEmail: "test@example.com",
+      after: new Date("2026-01-01T00:00:00Z"),
+      timeoutMs: 25,
+      pollIntervalMs: 1,
+      subjectMatches: /sign in/i,
+    });
+
+    const getObjectCalls = mockS3Client.send.mock.calls.filter(([command]) => command instanceof GetObjectCommand);
+    expect(email).toBeNull();
+    expect(getObjectCalls).toHaveLength(1);
   });
 });

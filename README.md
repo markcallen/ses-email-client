@@ -185,7 +185,7 @@ Returns: `Promise<Email | null>`
 
 ##### `waitForEmail(options)`
 
-Waits for a new email matching optional filters.
+Waits for an email matching optional filters. Pass `after` to exclude messages that were already present in the bucket.
 
 - `recipientEmail` (string): Email address of the recipient
 - `timeoutMs` (number): Maximum time to wait in milliseconds (default: 30000)

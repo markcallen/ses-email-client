@@ -108,7 +108,7 @@ export class SESEmailClient {
    * Wait for the latest email for a given recipient
    * @param recipientEmail - Email address of the recipient (e.g., "test@example.com")
    * @param timeout - Maximum time to wait in milliseconds
-   * @param unreadOnly - If true, only return emails that haven't been read (not implemented yet)
+   * @param unreadOnly - If true, only consider emails with an S3 LastModified timestamp after the wait starts
    * @returns The latest email or null if timeout
    */
   async waitForLatestEmail(
@@ -130,22 +130,42 @@ export class SESEmailClient {
     const timeoutMs = options.timeoutMs ?? 30000;
     const pollIntervalMs = options.pollIntervalMs ?? 1000;
     const startTime = Date.now();
+    const checkedNonMatchingKeys = new Set<string>();
 
     while (Date.now() - startTime < timeoutMs) {
       const summaries = await this.listEmailSummaries(options.recipientEmail);
       const candidates = summaries
-        .filter((summary) => !options.after || !summary.lastModified || summary.lastModified >= options.after)
+        .filter((summary) => !options.after || (!!summary.lastModified && summary.lastModified >= options.after))
         .sort((a, b) => (b.lastModified?.getTime() || 0) - (a.lastModified?.getTime() || 0));
 
       for (const summary of candidates) {
+        const fingerprint = `${summary.key}:${summary.lastModified?.toISOString() || ""}:${summary.size || 0}`;
+        if (checkedNonMatchingKeys.has(fingerprint)) {
+          continue;
+        }
+
+        if (Date.now() - startTime >= timeoutMs) {
+          return null;
+        }
+
         const email = await this.getEmail(options.recipientEmail, summary.key);
 
         if (this.emailMatches(email, options)) {
+          if (Date.now() - startTime >= timeoutMs) {
+            return null;
+          }
           return email;
         }
+
+        checkedNonMatchingKeys.add(fingerprint);
       }
 
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      const remainingMs = timeoutMs - (Date.now() - startTime);
+      if (remainingMs <= 0) {
+        return null;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, remainingMs)));
     }
 
     return null;
@@ -298,8 +318,9 @@ export class SESEmailClient {
    */
   getEmailCodes(email: Email, pattern: RegExp = /\b\d{6}\b/g): string[] {
     const body = [email.text, email.html].filter(Boolean).join("\n");
-    const globalPattern = pattern.global ? pattern : new RegExp(pattern.source, `${pattern.flags}g`);
-    return [...body.matchAll(globalPattern)].map((match) => match[0]);
+    const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
+    const globalPattern = new RegExp(pattern.source, flags);
+    return [...new Set([...body.matchAll(globalPattern)].map((match) => match[0]))];
   }
 
   /**
